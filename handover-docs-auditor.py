@@ -21,3 +21,5 @@ DB_CONFIG = {
     'dbname': 'documentación_legal',  
     'port': '5432' 
 }
+
+# rutas al repositorio 
