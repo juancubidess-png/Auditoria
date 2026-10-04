@@ -2,19 +2,28 @@ import os
 import re
 import sys
 from collections import defaultdict
-from contextlib import closing
 from pathlib import Path
 
 import psycopg2
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 console = Console()
 
+
+def fallar(titulo, detalle, pista=None):
+    """Muestra un error claro y termina el programa."""
+    console.print(f"[bold red][{titulo}][/bold red] {escape(str(detalle).strip())}")
+    if pista:
+        console.print(f"[yellow]Pista:[/yellow] {pista}")
+    sys.exit(1)
+
+
 # --- Configuración -----------------------------------------------------------
 password = os.getenv("AIVEN_DB_PASSWORD")
 if not password:
-    sys.exit("Variable de entorno AIVEN_DB_PASSWORD no definida.")
+    fallar("CONFIGURACIÓN", "Variable de entorno AIVEN_DB_PASSWORD no definida.")
 
 DB_CONFIG = {
     "host": "pg-140abf34-cun-c29c.a.aivencloud.com",
@@ -26,12 +35,21 @@ DB_CONFIG = {
     "connect_timeout": "10",
 }
 
-RUTA_ACTAS = os.getenv("RUTA_ACTAS", "/ruta/a/actas")
-RUTA_ACUERDOS = os.getenv("RUTA_ACUERDOS", "/ruta/a/acuerdos")
+RUTA_ACTAS = os.getenv("RUTA_ACTAS", "/home/thor/Documents/advanced_programming/02. ACTAS ENTREGA")
+RUTA_ACUERDOS = os.getenv("RUTA_ACUERDOS", "/home/thor/Documents/advanced_programming/01. ACUERDOS RESPONSABILIDAD")
 IGNORAR = ("01. CONSOLIDADO", "02. ACTAS DE ENTREGA PERIFERICOS")
 
 REGEX_ACTA = re.compile(r"Acta\s+(?:de\s+)?Entrega\s*(?:-)?\s*([A-Za-z0-9]+)\s*-\s*([^-.]+)", re.I)
 REGEX_ACUERDO = re.compile(r"Acuerdo\s+(?:de\s+)?Responsabilidad\s*(?:-)?\s*([^-.]+)", re.I)
+
+PISTAS = {
+    "password authentication failed": "Usuario o contraseña incorrectos. Revisa AIVEN_DB_PASSWORD.",
+    "timeout expired": "El servidor no respondió en 10 s. Revisa internet/firewall y que el servicio Aiven esté encendido.",
+    "could not translate host name": "No se resuelve el host. Revisa el host o tu conexión a internet.",
+    "connection refused": "Host o puerto incorrectos, o el servicio está apagado.",
+    "does not exist": "La base de datos no existe. Ojo con la tilde en 'documentación_legal'.",
+    "ssl": "Problema de SSL. Aiven exige sslmode=require.",
+}
 
 
 # --- Nombres -----------------------------------------------------------------
@@ -44,8 +62,19 @@ def mismo_nombre(a, b):
 
 
 # --- Base de datos -----------------------------------------------------------
-def cargar_bd():
-    with closing(psycopg2.connect(**DB_CONFIG)) as conn, conn.cursor() as cur:
+def conectar():
+    console.print("Conectando a Aiven PostgreSQL...")
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+    except psycopg2.Error as e:
+        pista = next((p for k, p in PISTAS.items() if k in str(e).lower()), None)
+        fallar("FALLO DE CONEXIÓN", e, pista)
+    console.print("[green][OK] Conexión establecida.[/green]")
+    return conn
+
+
+def cargar_bd(conn):
+    with conn.cursor() as cur:
         cur.execute("""
             SELECT UPPER(TRIM(e.placa_equipo)), u.nombre_completo
             FROM actas_entrega a
@@ -62,12 +91,17 @@ def cargar_bd():
             JOIN usuarios u ON ar.id_usuario = u.id_usuario
         """)
         acuerdos = [tokens(r[0]) for r in cur.fetchall()]
+
+    total_actas = sum(map(len, actas.values()))
+    console.print(f"[green][OK] Datos cargados:[/green] {total_actas} actas y {len(acuerdos)} acuerdos en BD.\n")
     return actas, acuerdos
 
 
 # --- Archivos ----------------------------------------------------------------
 def archivos(ruta, regex, ignorar=()):
     """Genera (grupos_del_regex, ruta_archivo) por cada archivo que cumpla el patrón."""
+    if not Path(ruta).is_dir():
+        fallar("RUTA NO ENCONTRADA", ruta, "Revisa la ruta o defínela con RUTA_ACTAS / RUTA_ACUERDOS.")
     for f in Path(ruta).rglob("*.*"):
         m = regex.search(f.name)
         if m and not any(i in str(f) for i in ignorar):
@@ -82,15 +116,18 @@ def tabla(titulo, columnas, filas):
     for c in columnas:
         t.add_column(c)
     for fila in sorted(filas):
-        t.add_row(*fila)
+        t.add_row(*map(escape, fila))
     console.print(t, "\n")
 
 
 def main():
+    conn = conectar()
     try:
-        actas_db, acuerdos_db = cargar_bd()
+        actas_db, acuerdos_db = cargar_bd(conn)
     except psycopg2.Error as e:
-        sys.exit(f"Error de base de datos: {e}")
+        fallar("ERROR EN CONSULTA", e, "Revisa que las tablas y columnas existan con esos nombres.")
+    finally:
+        conn.close()
 
     actas = [
         (placa.upper(), usuario.strip(), ruta)
