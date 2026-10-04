@@ -1,68 +1,111 @@
-import csv
 import os
 import re
-import psycopg2
-from pathlib import Path
+import sys
 from collections import defaultdict
+from contextlib import closing
+from pathlib import Path
+
+import psycopg2
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
 
 console = Console()
 
+# --- Configuración -----------------------------------------------------------
+password = os.getenv("AIVEN_DB_PASSWORD")
+if not password:
+    sys.exit("Variable de entorno AIVEN_DB_PASSWORD no definida.")
 
-#============================================
-# 1. Leer la contraseña
-#============================================
-db_password = os.getenv('AIVEN_DB_PASSWORD')
-
-#=====================================================
-# 2. Validar que la variable de entorno no esté vacía
-#=====================================================
-if not db_password:
-    console.print("[bold red][CRÍTICO][/bold red] Variable de entorno 'AIVEN_DB_PASSWORD' no definida. Ejecución abortada.")
-    exit(1)
-
-#=====================================================
-# 3. Configuración de BD 
-#=====================================================
 DB_CONFIG = {
-    'host': 'pg-140abf34-cun-c29c.a.aivencloud.com',
-    'user': 'avnadmin',
-    'password': db_password,
-    'dbname': 'documentación_legal',
-    'port': '22070',
-    'sslmode': 'require',
-    'connect_timeout': '10' 
+    "host": "pg-140abf34-cun-c29c.a.aivencloud.com",
+    "user": "avnadmin",
+    "password": password,
+    "dbname": "documentación_legal",
+    "port": "22070",
+    "sslmode": "require",
+    "connect_timeout": "10",
 }
 
-#=====================================================
-# 4. Prueba de Conexión
-#=====================================================
-try:
-    console.print("Estableciendo conexión con Aiven PostgreSQL...")
-    conexion = psycopg2.connect(**DB_CONFIG)
-    console.print("[bold green][OK] Conexión establecida correctamente.[/bold green]")
-    conexion.close()
-except psycopg2.Error as db_error:
-    console.print("[bold red][FALLO DE CONEXIÓN][/bold red] El servidor de base de datos devolvió el siguiente error:")
-    console.print(f"[white]{db_error}[/white]")
-    exit(1)
-except Exception as e:
-    console.print("[bold red][ERROR DEL SISTEMA][/bold red] La ejecución fue interrumpida por la siguiente excepción:")
-    console.print(f"[white]{e}[/white]")
-    exit(1)
+RUTA_ACTAS = os.getenv("RUTA_ACTAS", "/ruta/a/actas")
+RUTA_ACUERDOS = os.getenv("RUTA_ACUERDOS", "/ruta/a/acuerdos")
+IGNORAR = ("01. CONSOLIDADO", "02. ACTAS DE ENTREGA PERIFERICOS")
 
-# ================================================================================================================
-# 3. Regex y Normalización
-# ================================================================================================================
-REGEX_ACTA = re.compile(r"Acta\s+(?:de\s+)?Entrega\s*(?:-)?\s*([A-Za-z0-9]+)\s*-\s*([^-.]+)", re.IGNORECASE)
-REGEX_ACUERDO = re.compile(r"Acuerdo\s+(?:de\s+)?Responsabilidad\s*(?:-)?\s*([^-.]+)", re.IGNORECASE)
+REGEX_ACTA = re.compile(r"Acta\s+(?:de\s+)?Entrega\s*(?:-)?\s*([A-Za-z0-9]+)\s*-\s*([^-.]+)", re.I)
+REGEX_ACUERDO = re.compile(r"Acuerdo\s+(?:de\s+)?Responsabilidad\s*(?:-)?\s*([^-.]+)", re.I)
 
-def tokenizar_nombre(nombre_raw):
-    if not nombre_raw or str(nombre_raw).strip() in ["", "-", "N/A"]: return set()
-    return set(re.findall(r'\w+', str(nombre_raw).lower()))
 
-def buscar_match_flexible(tokens_a, tokens_b):
-    if not tokens_a or not tokens_b: return False
-    return tokens_a.issubset(tokens_b) or tokens_b.issubset(tokens_a) or len(tokens_a.intersection(tokens_b)) >= 2
+# --- Nombres -----------------------------------------------------------------
+def tokens(nombre):
+    return set(re.findall(r"\w+", (nombre or "").lower()))
+
+
+def mismo_nombre(a, b):
+    return bool(a and b) and (a <= b or b <= a or len(a & b) >= 2)
+
+
+# --- Base de datos -----------------------------------------------------------
+def cargar_bd():
+    with closing(psycopg2.connect(**DB_CONFIG)) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT UPPER(TRIM(e.placa_equipo)), u.nombre_completo
+            FROM actas_entrega a
+            JOIN equipos  e ON a.id_equipo  = e.id_equipo
+            JOIN usuarios u ON a.id_usuario = u.id_usuario
+        """)
+        actas = defaultdict(list)
+        for placa, usuario in cur.fetchall():
+            actas[placa].append(tokens(usuario))
+
+        cur.execute("""
+            SELECT u.nombre_completo
+            FROM acuerdos_responsabilidad ar
+            JOIN usuarios u ON ar.id_usuario = u.id_usuario
+        """)
+        acuerdos = [tokens(r[0]) for r in cur.fetchall()]
+    return actas, acuerdos
+
+
+# --- Archivos ----------------------------------------------------------------
+def archivos(ruta, regex, ignorar=()):
+    """Genera (grupos_del_regex, ruta_archivo) por cada archivo que cumpla el patrón."""
+    for f in Path(ruta).rglob("*.*"):
+        m = regex.search(f.name)
+        if m and not any(i in str(f) for i in ignorar):
+            yield m.groups(), str(f)
+
+
+# --- Reporte -----------------------------------------------------------------
+def tabla(titulo, columnas, filas):
+    if not filas:
+        return console.print(f"[green][OK] {titulo}: todo registrado en BD.[/green]\n")
+    t = Table(title=f"[yellow]{titulo} ({len(filas)})[/yellow]", show_lines=True)
+    for c in columnas:
+        t.add_column(c)
+    for fila in sorted(filas):
+        t.add_row(*fila)
+    console.print(t, "\n")
+
+
+def main():
+    try:
+        actas_db, acuerdos_db = cargar_bd()
+    except psycopg2.Error as e:
+        sys.exit(f"Error de base de datos: {e}")
+
+    actas = [
+        (placa.upper(), usuario.strip(), ruta)
+        for (placa, usuario), ruta in archivos(RUTA_ACTAS, REGEX_ACTA, IGNORAR)
+        if not any(mismo_nombre(tokens(usuario), t) for t in actas_db.get(placa.upper(), []))
+    ]
+    acuerdos = [
+        (usuario.strip(), ruta)
+        for (usuario,), ruta in archivos(RUTA_ACUERDOS, REGEX_ACUERDO)
+        if not any(mismo_nombre(tokens(usuario), t) for t in acuerdos_db)
+    ]
+
+    tabla("ACTAS NO REGISTRADAS", ["Placa", "Usuario", "Ruta"], actas)
+    tabla("ACUERDOS NO REGISTRADOS", ["Usuario", "Ruta"], acuerdos)
+
+
+if __name__ == "__main__":
+    main()
