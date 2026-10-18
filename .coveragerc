@@ -1,0 +1,3 @@
+[run]
+source = auditor
+omit = auditor/__main__.py

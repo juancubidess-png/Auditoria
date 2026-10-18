@@ -1,0 +1,4 @@
+pytest
+coverage
+psycopg2-binary
+rich

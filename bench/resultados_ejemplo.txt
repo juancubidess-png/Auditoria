@@ -1,0 +1,13 @@
+     n=m   secuencial (s)   indexado (s)   mejora  iguales
+     500           0.0371         0.0010    38.3x     True
+    1000           0.1501         0.0038    39.3x     True
+    2000           0.5989         0.0066    90.2x     True
+    4000           2.4518         0.0192   127.4x     True
+
+Solo indexado (el secuencial es inviable):
+   10000     0.1019 s
+   50000     2.4823 s
+  100000    10.1012 s
+
+Estrés de escaneo con 20000 archivos:
+  archivos reconocidos: 20000 | tiempo: 0.31 s | memoria pico: 0.12 MB
